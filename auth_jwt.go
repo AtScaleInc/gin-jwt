@@ -1,7 +1,9 @@
 package jwt
 
 import (
+	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -19,12 +21,13 @@ type GinJWTMiddleware struct {
 	// Realm name to display to the user. Required.
 	Realm string
 
-	// signing algorithm - possible values are HS256, HS384, HS512
+	// signing algorithm - possible values are RS256, HS256, HS384, HS512
 	// Optional, default is HS256.
 	SigningAlgorithm string
 
 	// Secret key used for signing. Required.
-	Key []byte
+	PrivateKey *rsa.PrivateKey
+	PublicKey  *rsa.PublicKey
 
 	// Duration that a jwt token is valid. Optional, defaults to one hour.
 	Timeout time.Duration
@@ -38,7 +41,7 @@ type GinJWTMiddleware struct {
 	// Callback function that should perform the authentication of the user based on userID and
 	// password. Must return true on success, false on failure. Required.
 	// Option return user id, if so, user id will be stored in Claim Array.
-	Authenticator func(userID string, password string, c *gin.Context) (string, bool)
+	Authenticator func(userID string, password string, orgID string, c *gin.Context) (string, bool)
 
 	// Callback function that should perform the authorization of the authenticated user. Called
 	// only after an authentication success. Must return true on success, false on failure.
@@ -79,6 +82,7 @@ type GinJWTMiddleware struct {
 type Login struct {
 	Username string `form:"username" json:"username" binding:"required"`
 	Password string `form:"password" json:"password" binding:"required"`
+	OrgID    string `form:"orgID" json:"orgID" binding:"required"`
 }
 
 // MiddlewareInit initialize jwt configs.
@@ -130,8 +134,11 @@ func (mw *GinJWTMiddleware) MiddlewareInit() error {
 		return errors.New("realm is required")
 	}
 
-	if mw.Key == nil {
-		return errors.New("secret key is required")
+	if mw.PrivateKey == nil {
+		return errors.New("private key is required")
+	}
+	if mw.PublicKey == nil {
+		return errors.New("public key is required")
 	}
 
 	return nil
@@ -139,6 +146,7 @@ func (mw *GinJWTMiddleware) MiddlewareInit() error {
 
 // MiddlewareFunc makes GinJWTMiddleware implement the Middleware interface.
 func (mw *GinJWTMiddleware) MiddlewareFunc() gin.HandlerFunc {
+
 	if err := mw.MiddlewareInit(); err != nil {
 		return func(c *gin.Context) {
 			mw.unauthorized(c, http.StatusInternalServerError, err.Error())
@@ -153,6 +161,7 @@ func (mw *GinJWTMiddleware) MiddlewareFunc() gin.HandlerFunc {
 }
 
 func (mw *GinJWTMiddleware) middlewareImpl(c *gin.Context) {
+
 	token, err := mw.parseToken(c)
 
 	if err != nil {
@@ -164,7 +173,7 @@ func (mw *GinJWTMiddleware) middlewareImpl(c *gin.Context) {
 
 	id := mw.IdentityHandler(claims)
 	c.Set("JWT_PAYLOAD", claims)
-	c.Set("userID", id)
+	c.Set("sub", id)
 
 	if !mw.Authorizator(id, c) {
 		mw.unauthorized(c, http.StatusForbidden, "You don't have permission to access.")
@@ -194,7 +203,7 @@ func (mw *GinJWTMiddleware) LoginHandler(c *gin.Context) {
 		return
 	}
 
-	userID, ok := mw.Authenticator(loginVals.Username, loginVals.Password, c)
+	userID, ok := mw.Authenticator(loginVals.Username, loginVals.Password, loginVals.OrgID, c)
 
 	if !ok {
 		mw.unauthorized(c, http.StatusUnauthorized, "Incorrect Username / Password")
@@ -216,14 +225,14 @@ func (mw *GinJWTMiddleware) LoginHandler(c *gin.Context) {
 	}
 
 	expire := mw.TimeFunc().Add(mw.Timeout)
-	claims["id"] = userID
+	claims["sub"] = userID
 	claims["exp"] = expire.Unix()
 	claims["orig_iat"] = mw.TimeFunc().Unix()
 
-	tokenString, err := token.SignedString(mw.Key)
+	tokenString, err := token.SignedString(mw.PrivateKey)
 
 	if err != nil {
-		mw.unauthorized(c, http.StatusUnauthorized, "Create JWT Token faild")
+		mw.unauthorized(c, http.StatusUnauthorized, fmt.Sprintf("Create JWT Token failed:%v", err))
 		return
 	}
 
@@ -237,6 +246,7 @@ func (mw *GinJWTMiddleware) LoginHandler(c *gin.Context) {
 // Shall be put under an endpoint that is using the GinJWTMiddleware.
 // Reply will be of the form {"token": "TOKEN"}.
 func (mw *GinJWTMiddleware) RefreshHandler(c *gin.Context) {
+
 	token, _ := mw.parseToken(c)
 	claims := token.Claims.(jwt.MapClaims)
 
@@ -260,7 +270,7 @@ func (mw *GinJWTMiddleware) RefreshHandler(c *gin.Context) {
 	newClaims["exp"] = expire.Unix()
 	newClaims["orig_iat"] = origIat
 
-	tokenString, err := newToken.SignedString(mw.Key)
+	tokenString, err := newToken.SignedString(mw.PrivateKey)
 
 	if err != nil {
 		mw.unauthorized(c, http.StatusUnauthorized, "Create JWT Token faild")
@@ -288,6 +298,7 @@ func ExtractClaims(c *gin.Context) jwt.MapClaims {
 
 // TokenGenerator handler that clients can use to get a jwt token.
 func (mw *GinJWTMiddleware) TokenGenerator(userID string) string {
+
 	token := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
 	claims := token.Claims.(jwt.MapClaims)
 
@@ -297,16 +308,17 @@ func (mw *GinJWTMiddleware) TokenGenerator(userID string) string {
 		}
 	}
 
-	claims["id"] = userID
+	claims["sub"] = userID
 	claims["exp"] = mw.TimeFunc().Add(mw.Timeout).Unix()
 	claims["orig_iat"] = mw.TimeFunc().Unix()
 
-	tokenString, _ := token.SignedString(mw.Key)
+	tokenString, _ := token.SignedString(mw.PrivateKey)
 
 	return tokenString
 }
 
 func (mw *GinJWTMiddleware) jwtFromHeader(c *gin.Context, key string) (string, error) {
+
 	authHeader := c.Request.Header.Get(key)
 
 	if authHeader == "" {
@@ -322,6 +334,7 @@ func (mw *GinJWTMiddleware) jwtFromHeader(c *gin.Context, key string) (string, e
 }
 
 func (mw *GinJWTMiddleware) jwtFromQuery(c *gin.Context, key string) (string, error) {
+
 	token := c.Query(key)
 
 	if token == "" {
@@ -342,6 +355,7 @@ func (mw *GinJWTMiddleware) jwtFromCookie(c *gin.Context, key string) (string, e
 }
 
 func (mw *GinJWTMiddleware) parseToken(c *gin.Context) (*jwt.Token, error) {
+
 	var token string
 	var err error
 
@@ -364,7 +378,7 @@ func (mw *GinJWTMiddleware) parseToken(c *gin.Context) (*jwt.Token, error) {
 			return nil, errors.New("invalid signing algorithm")
 		}
 
-		return mw.Key, nil
+		return mw.PublicKey, nil
 	})
 }
 
